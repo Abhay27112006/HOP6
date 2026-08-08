@@ -1,0 +1,52 @@
+# Hop6 .gitignore
+
+# Model weights and data (large files)
+hop6_data/models/
+hop6_data/hop6_models/
+hop6_data/routers/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pyc
+
+# Build artifacts
+build/
+dist/
+*.spec
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+venv/
+env/
+
+# Logs
+*.log
+wandb/
+
+# Checkpoints (if any)
+*.pt
+*.bin
+*.safetensors
+!src/*.pt
+
+# Config (user-specific)
+hop6_config.json
+
+# Test outputs
+*.png
+*.jpg
+*.jpeg

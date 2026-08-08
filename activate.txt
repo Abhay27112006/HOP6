@@ -1,0 +1,1 @@
+source ~/hop6_env/bin/activate
