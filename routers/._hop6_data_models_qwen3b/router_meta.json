@@ -1,0 +1,10 @@
+{
+  "architecture": "Hop6_Dijkstra_v2",
+  "original_model": "./hop6_data/models/qwen3b",
+  "router_params": 1072173,
+  "bridge_params": 2633729,
+  "epochs": 3,
+  "lr": 0.0005,
+  "training_samples": 30,
+  "bridge_active_during_training": true
+}

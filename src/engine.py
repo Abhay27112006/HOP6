@@ -18,8 +18,26 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 import device_utils
 
 
-def build_layer_graph(num_layers, wormhole_pct=0.30):
+def build_layer_graph(num_layers, wormhole_pct=0.30, seed=None, fixed_edges=None):
+    """Build layer connectivity graph with optional wormhole shortcuts.
+
+    Args:
+        fixed_edges: If provided, use these exact edges (for reproducibility
+                     when loading a trained bridge at inference).
+        seed: If provided, use for deterministic random wormhole placement.
+    """
     G = nx.DiGraph()
+
+    # If we have saved edges from a trained bridge, reconstruct the exact graph
+    if fixed_edges is not None:
+        for i in range(num_layers):
+            G.add_node(i)
+        for src, dst in fixed_edges:
+            G.add_edge(src, dst)
+        return G, list(fixed_edges)
+
+    # Use a local RNG so we don't disturb global random state
+    rng = random.Random(seed)
     edges = []
     for i in range(num_layers):
         G.add_node(i)
@@ -29,8 +47,8 @@ def build_layer_graph(num_layers, wormhole_pct=0.30):
     num_wormholes = int(num_layers * wormhole_pct)
     added = 0
     while added < num_wormholes:
-        src = random.randint(0, num_layers - 3)
-        dst = random.randint(src + 2, num_layers - 1)
+        src = rng.randint(0, num_layers - 3)
+        dst = rng.randint(src + 2, num_layers - 1)
         if not G.has_edge(src, dst):
             G.add_edge(src, dst)
             edges.append((src, dst))
@@ -57,7 +75,7 @@ def convert_to_hop6(model_id, save_dir, max_hops=6, wormhole_pct=0.30):
     print(f"[Hop6] Loading {model_id}...")
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
-        model_id, torch_dtype=torch.float16, device_map="cpu", trust_remote_code=True
+        model_id, torch_dtype=torch.bfloat16, device_map="cpu", trust_remote_code=True
     )
     if not hasattr(model, "model") or not hasattr(model.model, "layers"):
         raise ValueError("Model not supported. Must have model.model.layers.")
@@ -109,7 +127,9 @@ class Hop6DynamicEngine(nn.Module):
     Wraps any HF causal-LM. All layers stay on CPU.
     Each forward pass routes through max_hops layers via VRAM paging.
     """
-    def __init__(self, model, wormhole_pct=0.30, max_hops=6, target_device=None, use_bridge=False):
+    def __init__(self, model, wormhole_pct=0.30, max_hops=6, target_device=None,
+                 use_bridge=False, use_router=False, use_sdp=False,
+                 sdp_threshold=0.01, graph_seed=None, fixed_edges=None):
         super().__init__()
         self.target_device = target_device or device_utils.get_device()
         self.model = model
@@ -122,7 +142,10 @@ class Hop6DynamicEngine(nn.Module):
             layer.to("cpu")
             layer.layer_idx = i
 
-        self.graph, self.edges = build_layer_graph(self.num_layers, wormhole_pct)
+        self.graph, self.edges = build_layer_graph(
+            self.num_layers, wormhole_pct, seed=graph_seed, fixed_edges=fixed_edges
+        )
+        self._fixed_path = None  # Set externally to override random path selection
 
         hidden_dim = self.model.config.hidden_size
 
@@ -130,6 +153,17 @@ class Hop6DynamicEngine(nn.Module):
         self.bridge = None
         if use_bridge:
             self.bridge = BridgeNetwork(hidden_dim, self.num_layers).to(self.target_device).to(model.dtype)
+
+        # Router is optional — enables learned path selection via Dijkstra
+        self.router = None
+        if use_router:
+            self.router = TokenRouter(hidden_dim, len(self.edges)).to(self.target_device).to(model.dtype)
+
+        # SDP (Sparse Delta Propagation) — novel CPU matmul optimization
+        self._sdp_enabled = False
+        if use_sdp:
+            from sdp_cpu import apply_sdp_to_engine
+            apply_sdp_to_engine(self, sparsity_threshold=sdp_threshold)
 
         self.model.model.embed_tokens.to(self.target_device)
         if hasattr(self.model.model, "norm"):
@@ -211,7 +245,7 @@ class Hop6DynamicEngine(nn.Module):
 
         # Pick path: random (no trained router) or fixed sequential
         if self.current_path is None:
-            path = self._pick_random_path()
+            path = self._pick_random_path(hidden_states)
             self.current_path = path
         else:
             path = self.current_path
@@ -262,8 +296,12 @@ class Hop6DynamicEngine(nn.Module):
             past_key_values=next_decoder_cache
         )
 
-    def _pick_random_path(self):
-        """Pick a random valid path from layer 0 to last within max_hops."""
+    def _pick_random_path(self, hidden_states=None):
+        """Pick a path. Uses fixed_path if set, router if available, otherwise random."""
+        if self._fixed_path is not None:
+            return list(self._fixed_path)
+        if self.router is not None and hidden_states is not None:
+            return self._pick_router_path(hidden_states)
         try:
             paths = list(nx.all_simple_paths(self.graph, source=0, target=self.num_layers - 1, cutoff=self.max_hops))
             if paths:
@@ -272,6 +310,26 @@ class Hop6DynamicEngine(nn.Module):
             pass
         # Fallback: sequential path
         return list(range(min(self.max_hops, self.num_layers))) + ([self.num_layers - 1] if self.max_hops < self.num_layers else [])
+
+    def _pick_router_path(self, hidden_states):
+        """Use the trained router to set edge costs and run Dijkstra."""
+        import torch.nn.functional as F
+        # Use the actual last token embedding to predict the best path for this prompt
+        last_tok = hidden_states[:, -1, :].to(self.target_device).to(next(self.router.parameters()).dtype)
+        with torch.no_grad():
+            edge_logits = self.router(last_tok)
+            edge_costs = F.softplus(edge_logits).clamp(min=1e-3, max=10.0)
+        costs_np = edge_costs[0].cpu().numpy()
+        for idx, (u, v) in enumerate(self.edges):
+            self.graph[u][v]["weight"] = costs_np[idx].item()
+        try:
+            path = nx.shortest_path(self.graph, source=0,
+                                    target=self.num_layers - 1, weight="weight")
+            if len(path) > self.max_hops:
+                path = path[:self.max_hops - 1] + [self.num_layers - 1]
+            return path
+        except nx.NetworkXNoPath:
+            return [0, self.num_layers - 1]
 
     def _cleanup_vram(self):
         if self.current_path:
@@ -283,6 +341,10 @@ class Hop6DynamicEngine(nn.Module):
 
     def generate(self, *args, **kwargs):
         self.current_path = None
+        # Reset SDP caches for new generation
+        if self._sdp_enabled:
+            from sdp_cpu import reset_sdp_caches
+            reset_sdp_caches(self)
         try:
             return self.model.generate(*args, **kwargs)
         finally:
@@ -301,6 +363,28 @@ class Hop6DynamicEngine(nn.Module):
     @property
     def device(self):
         return torch.device(self.target_device)
+
+    def print_sdp_stats(self):
+        """Print SDP performance report if SDP is enabled."""
+        if self._sdp_enabled:
+            from sdp_cpu import print_sdp_report
+            print_sdp_report(self)
+
+
+class TokenRouter(nn.Module):
+    """Lightweight MLP that predicts edge costs for Dijkstra path selection."""
+    def __init__(self, hidden_dim, num_edges):
+        super().__init__()
+        mid = hidden_dim // 4
+        self.net = nn.Sequential(
+            nn.Linear(hidden_dim, mid),
+            nn.GELU(),
+            nn.Linear(mid, num_edges),
+        )
+
+    def forward(self, x):
+        """x: (batch, hidden_dim) → (batch, num_edges) raw logits."""
+        return self.net(x)
 
 
 class BridgeNetwork(nn.Module):
@@ -357,7 +441,7 @@ def load_hop6(local_path, device=None):
     device = device or device_utils.get_device()
     tokenizer = AutoTokenizer.from_pretrained(local_path, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
-        local_path, torch_dtype=torch.float16, device_map="cpu", trust_remote_code=True
+        local_path, torch_dtype=torch.bfloat16, device_map="cpu", trust_remote_code=True
     )
     paged = nn.ModuleList([PagedLayer(l, device) for l in model.model.layers])
     model.model.layers = nn.ModuleList()

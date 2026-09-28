@@ -1,8 +1,6 @@
 torch
 transformers
 networkx
-questionary
-rich
 numpy
 psutil
 huggingface_hub

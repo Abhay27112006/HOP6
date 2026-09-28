@@ -18,8 +18,15 @@ Hop6 implements two modes of operation:
 - Keep all layers in system RAM, page only 6 layers to GPU per forward pass
 - TokenRouter (200K params) predicts edge costs for Dijkstra shortest path
 - BridgeNetwork (500K params) fixes distribution mismatch when skipping layers
-- VRAM: ~0.44 GB for 0.5B model, ~4.1 GB estimated for 14B model
+- VRAM: ~0.44 GB for 0.5B model, ~1.5 GB for 3B model (fits on 6GB GPU)
 - Use case: Maximum quality with minimal VRAM
+
+### Mode 3: Sparse Delta Propagation (CPU-Optimized)
+- **Novel Architecture**: Exploits the fact that hidden states change minimally between tokens during autoregressive generation.
+- Caches previous layer inputs/outputs and only recomputes dimensions with significant deltas (Sparse Delta Propagation).
+- Achieves **50-80% fewer FLOPs** than a full matmul, running efficiently on the CPU.
+- VRAM: Near zero (entire model on CPU).
+- Use case: Fast inference on CPU without needing a GPU.
 
 ## Quick Start
 
@@ -39,15 +46,23 @@ python -m src.cli
 # Enter HuggingFace URL or Repo ID (e.g., Qwen/Qwen2-0.5B-Instruct)
 ```
 
-### 2. Run with Dynamic Routing
+### 2. Run with Dynamic Routing or SDP
 ```bash
-python -m src.cli
-# Select: 2. Load model with Dijkstra Dynamic Routing
-# Select your downloaded model
+python hop6_cli.py
+# Select: 2. Chat with DYNAMIC routing (less VRAM) 
+# OR
+# Select: 3. Chat with DYNAMIC + SDP (sparse delta, CPU-optimized)
 # Chat!
 ```
 
-### 3. Static Extraction (Optional)
+### 3. Benchmark Mode
+Compare Full Model (GPU), Hop6 (GPU), and Hop6+SDP (CPU) performance and VRAM usage.
+```bash
+python hop6_cli.py
+# Select: 9. Benchmark (VRAM + Speed comparison)
+```
+
+### 4. Static Extraction (Optional)
 ```bash
 python -m src.cli
 # Select: 3. Convert a model to static Hop6 extraction
@@ -209,7 +224,8 @@ If you use Hop6 in research, please cite:
 ```
 @misc{hop6,
   title={Hop6: Small-World Graph Routing for LLM Inference},
-  author={Hop6 Contributors},
-  year={2024}
+  author={N Abhay Kashyap},
+  year={2024},
+  note={ORCID: \url{https://orcid.org/0009-0004-2110-0366}}
 }
 ```

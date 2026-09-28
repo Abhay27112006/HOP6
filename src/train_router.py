@@ -24,7 +24,7 @@ import torch
 import torch.nn.functional as F
 import networkx as nx
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from engine import Hop6DijkstraEngine
+from engine import Hop6DynamicEngine
 import device_utils
 
 # --------------- Training Data ----------------------------------------
@@ -173,6 +173,7 @@ def train_router_for_model(engine, tokenizer, save_dir, model_name="unknown",
         print_fn = print
 
     device = engine.target_device
+    engine.router.to(torch.float32)
 
     # Freeze transformer + bridge, unfreeze only router
     for param in engine.model.parameters():
@@ -247,11 +248,11 @@ def train_standalone(model_id, epochs=3, lr=5e-4, save_dir=None):
     print(f"[Train] Loading {model_id} into CPU RAM...")
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
     base_model = AutoModelForCausalLM.from_pretrained(
-        model_id, torch_dtype=torch.float16, device_map="cpu", trust_remote_code=True
+        model_id, torch_dtype=torch.bfloat16, device_map="cpu", trust_remote_code=True
     )
 
-    print("[Train] Wrapping with Hop6 Dijkstra Engine...")
-    engine = Hop6DijkstraEngine(base_model, target_device=device)
+    print("[Train] Wrapping with Hop6 Dynamic Engine...")
+    engine = Hop6DynamicEngine(base_model, target_device=device, use_bridge=True, use_router=True)
 
     if save_dir is None:
         # Use a path relative to the project root

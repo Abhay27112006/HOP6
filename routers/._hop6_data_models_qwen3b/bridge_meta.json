@@ -1,0 +1,10 @@
+{
+  "architecture": "Hop6_Bridge",
+  "original_model": "./hop6_data/models/qwen3b",
+  "bridge_params": 2633729,
+  "epochs": 3,
+  "lr": 0.0005,
+  "calibration_samples": 60,
+  "wormhole_edges_trained": 10,
+  "final_gate": 0.002471923828125
+}
